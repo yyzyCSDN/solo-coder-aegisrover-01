@@ -2,9 +2,15 @@
 
 The repository is the platform's single source of truth for mission records, map
 revisions, session state and operational settings. Every write bumps a per-record
-version and records an immutable history row, so a caller that read version *n* can
-detect that somebody else already wrote version *n + 1* instead of silently
-overwriting it.
+version and records a history row, so a caller that read version *n* can detect
+that somebody else already wrote version *n + 1* instead of silently overwriting it.
+
+Two guards keep the store usable over months of writes. :meth:`Repository.transaction`
+groups any number of writes into one atomic unit, so a batch of related records
+commits all-or-nothing instead of leaving a half-applied set behind when something
+fails midway. And :meth:`Repository.prune_history` converges the history table
+according to a :class:`RetentionPolicy` — the newest versions of each record always
+survive, older ones are physically removed — so months of edits do not fill the disk.
 """
 from __future__ import annotations
 
@@ -12,10 +18,13 @@ import hashlib
 import json
 import sqlite3
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
+from itertools import groupby
 from typing import Any, Iterable, Iterator
 
-__all__ = ('Record', 'Page', 'VersionConflict', 'NotFound', 'Repository', 'canonical_json')
+__all__ = ('Record', 'Page', 'VersionConflict', 'NotFound', 'TransactionError',
+           'RetentionPolicy', 'Repository', 'canonical_json')
 
 
 def canonical_json(value: Any) -> str:
@@ -46,6 +55,31 @@ class NotFound(KeyError):
         super().__init__(f'{ns}/{key}')
         self.ns = ns
         self.key = key
+
+
+class TransactionError(RuntimeError):
+    """Raised when a transaction cannot commit because a nested unit failed."""
+
+
+@dataclass(frozen=True)
+class RetentionPolicy:
+    """How much history to keep per record when pruning.
+
+    A history row survives pruning when it is among the newest ``keep_versions``
+    rows of its record *or* younger than ``keep_seconds``; only a row that fails
+    both tests is removed, so the policy can be driven by count, by age, or both.
+    ``keep_versions`` must be at least 1 so the current version always keeps its
+    history row.
+    """
+
+    keep_versions: int = 10
+    keep_seconds: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.keep_versions < 1:
+            raise ValueError('keep_versions must be at least 1')
+        if self.keep_seconds is not None and self.keep_seconds <= 0:
+            raise ValueError('keep_seconds must be positive')
 
 
 @dataclass(frozen=True)
@@ -125,6 +159,8 @@ class Repository:
         self._conn.execute('PRAGMA journal_mode=WAL')
         self._conn.execute('PRAGMA foreign_keys=ON')
         self._conn.executescript(SCHEMA)
+        self._tx_depth = 0
+        self._tx_doomed = False
 
     # -- reads -----------------------------------------------------------------
     def get(self, ns: str, key: str, *, include_deleted: bool = False) -> Record:
@@ -154,14 +190,58 @@ class Repository:
         rows = self._conn.execute('SELECT DISTINCT ns FROM records ORDER BY ns').fetchall()
         return tuple(r['ns'] for r in rows)
 
+    # -- transactions ----------------------------------------------------------
+    @contextmanager
+    def transaction(self) -> Iterator['Repository']:
+        """Group any number of writes into one atomic unit.
+
+        Every ``put``/``delete`` (and every service method built on them) issued
+        inside the block commits together when the block exits cleanly; if the
+        body raises, everything is rolled back, so a batch of related records is
+        never left half applied. Blocks may nest: an inner block joins the outer
+        transaction, and if an inner failure is swallowed the outermost commit
+        raises :class:`TransactionError` rather than committing a partial set.
+
+        A single failed ``put``/``delete`` inside the block (for example a
+        :class:`VersionConflict` the caller catches and handles) does not doom
+        the batch — the failed statement simply never happened. Letting the
+        exception propagate out of the block always rolls everything back.
+        """
+        self._begin()
+        try:
+            yield self
+        except BaseException as exc:
+            self._finish(exc, doom=True)
+            raise
+        if self._tx_doomed:
+            self._finish(None, doom=False)
+            raise TransactionError(
+                'a nested operation failed; rolled back instead of committing a partial set')
+        self._finish(None, doom=False)
+
+    def _begin(self) -> None:
+        if self._tx_depth == 0:
+            self._conn.execute('BEGIN IMMEDIATE')
+            self._tx_doomed = False
+        self._tx_depth += 1
+
+    def _finish(self, error: BaseException | None, *, doom: bool) -> None:
+        if doom:
+            self._tx_doomed = True
+        self._tx_depth -= 1
+        if self._tx_depth == 0:
+            self._conn.execute('ROLLBACK' if error is not None or self._tx_doomed else 'COMMIT')
+            self._tx_doomed = False
+
     # -- writes ----------------------------------------------------------------
     def put(self, ns: str, key: str, payload: Any, *, expected: int | None = None) -> Record:
         """Insert or update ``payload``.
 
         ``expected=None`` means "create or overwrite unconditionally"; pass the
-        version you read to get optimistic concurrency instead.
+        version you read to get optimistic concurrency instead. Inside
+        :meth:`transaction` the write joins the surrounding atomic unit.
         """
-        self._conn.execute('BEGIN IMMEDIATE')
+        self._begin()
         try:
             row = self._conn.execute(
                 'SELECT version, deleted FROM records WHERE ns=? AND key=?', (ns, key)
@@ -186,15 +266,15 @@ class Repository:
                 ' VALUES (?,?,?,?,?,?,0,?)',
                 (ns, key, version, body, etag, updated_at, self._clock()),
             )
-            self._conn.execute('COMMIT')
-        except Exception:
-            self._conn.execute('ROLLBACK')
+        except Exception as exc:
+            self._finish(exc, doom=False)
             raise
+        self._finish(None, doom=False)
         return Record(ns, key, version, payload, etag, updated_at)
 
     def delete(self, ns: str, key: str, *, expected: int | None = None) -> Record:
         """Tombstone a record. History is preserved."""
-        self._conn.execute('BEGIN IMMEDIATE')
+        self._begin()
         try:
             row = self._conn.execute(
                 'SELECT version, payload FROM records WHERE ns=? AND key=? AND deleted=0', (ns, key)
@@ -216,11 +296,61 @@ class Repository:
                 ' VALUES (?,?,?,?,?,?,1,?)',
                 (ns, key, version, row['payload'], etag, updated_at, self._clock()),
             )
-            self._conn.execute('COMMIT')
-        except Exception:
-            self._conn.execute('ROLLBACK')
+        except Exception as exc:
+            self._finish(exc, doom=False)
             raise
+        self._finish(None, doom=False)
         return Record(ns, key, version, None, etag, updated_at, deleted=True)
+
+    # -- retention -------------------------------------------------------------
+    def prune_history(self, policy: RetentionPolicy, *, ns: str | None = None,
+                      now: float | None = None) -> dict[str, int]:
+        """Physically remove history rows that fall outside ``policy``.
+
+        For every record the newest ``policy.keep_versions`` history rows always
+        survive, and so does any row recorded within ``policy.keep_seconds`` of
+        ``now``; only rows that fail both tests are removed. The live record is
+        never touched. Returns the number of rows removed per namespace
+        (namespaces where nothing was pruned are omitted).
+        """
+        cutoff = None
+        if policy.keep_seconds is not None:
+            cutoff = (self._clock() if now is None else now) - policy.keep_seconds
+        removed: dict[str, int] = {}
+        with self.transaction():
+            query = 'SELECT ns, key, version, recorded_at FROM record_history'
+            args: tuple = ()
+            if ns is not None:
+                query += ' WHERE ns=?'
+                args = (ns,)
+            rows = self._conn.execute(query + ' ORDER BY ns, key, version', args).fetchall()
+            for (row_ns, key), group in groupby(rows, key=lambda r: (r['ns'], r['key'])):
+                stale = list(group)[:-policy.keep_versions]
+                for row in stale:
+                    if cutoff is not None and float(row['recorded_at']) >= cutoff:
+                        continue
+                    self._conn.execute(
+                        'DELETE FROM record_history WHERE ns=? AND key=? AND version=?',
+                        (row_ns, key, int(row['version'])),
+                    )
+                    removed[row_ns] = removed.get(row_ns, 0) + 1
+        return removed
+
+    def purge(self, ns: str, key: str) -> bool:
+        """Physically remove a record and all of its history.
+
+        This is the retention counterpart of :meth:`delete`: where ``delete``
+        tombstones and preserves history, ``purge`` reclaims the space. It is
+        meant for retention jobs — purging a namespace whose readers rely on an
+        unbroken sequence (such as the audit chain) breaks their guarantees.
+        Returns True if a live record was removed.
+        """
+        with self.transaction():
+            gone = self._conn.execute(
+                'DELETE FROM records WHERE ns=? AND key=?', (ns, key)
+            ).rowcount
+            self._conn.execute('DELETE FROM record_history WHERE ns=? AND key=?', (ns, key))
+        return bool(gone)
 
     # -- paging ----------------------------------------------------------------
     def page(self, ns: str, *, limit: int = 50, cursor: str | None = None, prefix: str = '') -> Page:

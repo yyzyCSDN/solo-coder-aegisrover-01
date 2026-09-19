@@ -3,8 +3,11 @@ import pytest
 
 from aegisrover.mission.allocation import Conflict, Deadlock, Reservation, ReservationBook
 from aegisrover.mission.lifecycle import InvalidTransition, MissionService
+from aegisrover.service.platform import PlatformService, ServiceError
 from aegisrover.storage.audit import AuditLog
-from aegisrover.storage.repository import NotFound, Repository, VersionConflict
+from aegisrover.storage.repository import (
+    NotFound, Repository, RetentionPolicy, TransactionError, VersionConflict,
+)
 
 
 class FakeClock:
@@ -47,6 +50,85 @@ def test_repository_paging_and_tombstones(repo):
         repo.get('missions', 'm04')
     assert repo.get('missions', 'm04', include_deleted=True).deleted
     assert repo.count('missions') == 6
+
+
+def test_transaction_commits_related_writes_atomically(repo):
+    repo.put('missions', 'm0', {'i': 0})
+    with repo.transaction():
+        repo.put('configs', 'robot-1', {'speed': 1.0})
+        repo.put('configs', 'robot-2', {'speed': 2.0})
+        repo.delete('missions', 'm0')
+    assert repo.get('configs', 'robot-1').payload == {'speed': 1.0}
+    assert repo.get('configs', 'robot-2').version == 1
+    with pytest.raises(NotFound):
+        repo.get('missions', 'm0')
+    assert [r.version for r in repo.history('configs', 'robot-1')] == [1]
+
+
+def test_transaction_rolls_back_everything_on_error(repo):
+    repo.put('configs', 'robot-1', {'speed': 1.0})
+    with pytest.raises(VersionConflict):
+        with repo.transaction():
+            repo.put('configs', 'robot-1', {'speed': 2.0}, expected=1)
+            repo.put('configs', 'robot-2', {'speed': 3.0})
+            repo.put('configs', 'robot-1', {'speed': 9.0}, expected=99)
+    assert repo.get('configs', 'robot-1').version == 1
+    assert repo.get('configs', 'robot-1').payload == {'speed': 1.0}
+    with pytest.raises(NotFound):
+        repo.get('configs', 'robot-2')
+    assert [r.version for r in repo.history('configs', 'robot-1')] == [1]
+
+
+def test_transaction_statement_failure_does_not_doom_batch(repo):
+    # A conflict the caller catches and handles must not sink the whole batch.
+    with repo.transaction():
+        repo.put('configs', 'a', {'v': 1})
+        with pytest.raises(VersionConflict):
+            repo.put('configs', 'a', {'v': 2}, expected=99)
+        repo.put('configs', 'b', {'v': 3})
+    assert repo.get('configs', 'a').payload == {'v': 1}
+    assert repo.get('configs', 'b').payload == {'v': 3}
+
+
+def test_transaction_nested_failure_dooms_outer_commit(repo):
+    with pytest.raises(TransactionError):
+        with repo.transaction():
+            repo.put('configs', 'a', {'v': 1})
+            with pytest.raises(RuntimeError):
+                with repo.transaction():
+                    repo.put('configs', 'b', {'v': 2})
+                    raise RuntimeError('boom')
+    with pytest.raises(NotFound):
+        repo.get('configs', 'a')
+    with pytest.raises(NotFound):
+        repo.get('configs', 'b')
+
+
+def test_prune_history_keeps_newest_versions(repo):
+    for i in range(5):
+        repo.put('configs', 'robot-1', {'rev': i})
+    removed = repo.prune_history(RetentionPolicy(keep_versions=2), ns='configs')
+    assert removed == {'configs': 3}
+    assert [r.version for r in repo.history('configs', 'robot-1')] == [4, 5]
+    assert repo.get('configs', 'robot-1').payload == {'rev': 4}
+
+
+def test_prune_history_respects_age_cutoff(repo):
+    # FakeClock advances 0.5 per call and each put calls it twice, so the six
+    # history rows are recorded at 1001.0 .. 1006.0.
+    for i in range(6):
+        repo.put('configs', 'robot-1', {'rev': i})
+    removed = repo.prune_history(RetentionPolicy(keep_versions=1, keep_seconds=2.0),
+                                 ns='configs', now=1006.0)
+    assert removed == {'configs': 3}
+    assert [r.version for r in repo.history('configs', 'robot-1')] == [4, 5, 6]
+
+
+def test_retention_policy_requires_keeping_current():
+    with pytest.raises(ValueError):
+        RetentionPolicy(keep_versions=0)
+    with pytest.raises(ValueError):
+        RetentionPolicy(keep_seconds=0)
 
 
 def test_audit_chain_detects_tampering(repo):
@@ -113,6 +195,39 @@ def test_mission_dispatch_respects_priority_and_capabilities(repo):
     second = service.claim_next('robot-2', ['lidar', 'arm'])
     assert second.mission_id == 'high'
     assert service.claim_next('robot-3', ['lidar', 'arm']) is None
+
+
+def test_service_transaction_applies_batch_all_or_nothing(repo):
+    service = PlatformService(repo, clock=FakeClock())
+    with service.transaction():
+        service.create_mission('m1', [(0, 0)], actor='ops')
+        service.save_map('yard', {'0,0': 1}, actor='ops')
+    assert service.get_mission('m1')['state'] == 'draft'
+    assert service.get_map('yard')['revision'] == 1
+
+    with pytest.raises(ServiceError):
+        with service.transaction():
+            service.save_map('depot', {'0,0': 1})
+            service.create_mission('m2', [(2, 2)])
+            service.save_map('depot', {'0,0': 2}, if_match=99)
+    with pytest.raises(ServiceError):
+        service.get_map('depot')
+    with pytest.raises(ServiceError):
+        service.get_mission('m2')
+
+
+def test_service_prune_history_is_audited(repo):
+    service = PlatformService(repo, clock=FakeClock())
+    service.create_mission('m1', [(0, 0)])
+    service.command_mission('m1', 'queue')
+    service.command_mission('m1', 'assign', assignee='robot-1')
+    service.command_mission('m1', 'start')
+    report = service.prune_history(RetentionPolicy(keep_versions=1), namespaces=['missions'])
+    assert report['removed'] == {'missions': 3}
+    assert [r.version for r in repo.history('missions', 'm1')] == [4]
+    assert service.get_mission('m1')['state'] == 'running'
+    assert 'maintenance.prune_history' in {e.action for e in service.audit.entries()}
+    assert service.audit.verify() == ()
 
 
 def test_reservations_are_half_open():

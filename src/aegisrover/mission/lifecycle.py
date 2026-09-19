@@ -130,9 +130,10 @@ class MissionService:
             updated_at=now,
             history=({'at': now, 'command': 'create', 'actor': actor, 'from': None, 'to': 'draft'},),
         )
-        self._repo.put(MISSION_NAMESPACE, mission_id, mission.to_dict())
-        self._audit.append(actor, 'mission.create', mission_id,
-                           {'priority': mission.priority, 'waypoints': len(points)})
+        with self._repo.transaction():
+            self._repo.put(MISSION_NAMESPACE, mission_id, mission.to_dict())
+            self._audit.append(actor, 'mission.create', mission_id,
+                               {'priority': mission.priority, 'waypoints': len(points)})
         return mission
 
     # -- commands --------------------------------------------------------------
@@ -171,9 +172,10 @@ class MissionService:
         entry = {'at': now, 'command': command, 'actor': actor, 'from': mission.state,
                  'to': target, 'reason': reason}
         updated = replace(mission, history=mission.history + (entry,), **updates)
-        self._repo.put(MISSION_NAMESPACE, mission_id, updated.to_dict(), expected=record.version)
-        self._audit.append(actor, f'mission.{command}', mission_id,
-                           {'from': mission.state, 'to': target, 'reason': reason})
+        with self._repo.transaction():
+            self._repo.put(MISSION_NAMESPACE, mission_id, updated.to_dict(), expected=record.version)
+            self._audit.append(actor, f'mission.{command}', mission_id,
+                               {'from': mission.state, 'to': target, 'reason': reason})
         return {'mission': updated.to_dict(), 'applied': True}
 
     # -- reads -----------------------------------------------------------------
@@ -213,9 +215,10 @@ class MissionService:
             raise InvalidTransition(mission_id, 'reorder', mission.state)
         updated = replace(mission, priority=int(priority), revision=mission.revision + 1,
                           updated_at=self._clock())
-        self._repo.put(MISSION_NAMESPACE, mission_id, updated.to_dict(), expected=record.version)
-        self._audit.append(actor, 'mission.reorder', mission_id,
-                           {'priority': int(priority), 'state': mission.state})
+        with self._repo.transaction():
+            self._repo.put(MISSION_NAMESPACE, mission_id, updated.to_dict(), expected=record.version)
+            self._audit.append(actor, 'mission.reorder', mission_id,
+                               {'priority': int(priority), 'state': mission.state})
         return updated
 
     def require(self, mission_id: str) -> Mission:

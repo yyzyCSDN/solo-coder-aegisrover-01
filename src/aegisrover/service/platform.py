@@ -12,21 +12,27 @@ from __future__ import annotations
 import hashlib
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterable
 
 from aegisrover.mission.lifecycle import InvalidTransition, MissionError, MissionService
 from aegisrover.mapping.revisions import MapFormatError, MapRepository, MapRevision
 from aegisrover.runtime.session import SessionError, SessionRegistry
 from aegisrover.storage.audit import AuditLog
 from aegisrover.storage.event_store import EventStore
-from aegisrover.storage.repository import NotFound, Repository, VersionConflict, canonical_json
+from aegisrover.storage.repository import (
+    NotFound, Repository, RetentionPolicy, VersionConflict, canonical_json,
+)
 
 __all__ = ('ServiceError', 'PlatformService')
 
 IDEMPOTENCY_NAMESPACE = 'idempotency'
 
 
-@dataclass(frozen=True)
+# Not frozen on purpose: the interpreter annotates exceptions while they
+# propagate (__traceback__, __cause__, __notes__, ...), and a frozen dataclass
+# rejects those writes — the error then cannot cross a @contextmanager such as
+# PlatformService.transaction().
+@dataclass
 class ServiceError(RuntimeError):
     code: str
     message: str
@@ -136,6 +142,42 @@ class PlatformService:
         digest = hashlib.sha256(canonical_json(entries).encode()).hexdigest()
         return {'entries': entries, 'etag': digest, 'breaks': [b.__dict__ for b in self.audit.verify()]}
 
+    # -- maintenance -------------------------------------------------------------
+    def transaction(self):
+        """Group several service calls into one all-or-nothing unit.
+
+        Everything written inside the block — records, audit entries and
+        idempotency markers — commits together when the block exits cleanly;
+        any exception rolls the whole batch back, so a set of interrelated
+        records is never left half applied.
+        """
+        return self.repository.transaction()
+
+    def prune_history(self, policy: RetentionPolicy, *,
+                      namespaces: Iterable[str] | None = None,
+                      actor: str = 'operator') -> dict:
+        """Prune record history according to ``policy`` and audit the removal.
+
+        ``namespaces=None`` prunes every namespace. Map revisions live one
+        record per revision, so their growth is reclaimed through
+        :meth:`MapRepository.prune_revisions` instead of here.
+        """
+        if namespaces is None:
+            removed = self.repository.prune_history(policy)
+        else:
+            removed: dict[str, int] = {}
+            for ns in namespaces:
+                for name, count in self.repository.prune_history(policy, ns=ns).items():
+                    removed[name] = removed.get(name, 0) + count
+        if removed:
+            self.audit.append(actor, 'maintenance.prune_history', 'repository', {
+                'removed': removed,
+                'keep_versions': policy.keep_versions,
+                'keep_seconds': policy.keep_seconds,
+            })
+        return {'removed': removed, 'keep_versions': policy.keep_versions,
+                'keep_seconds': policy.keep_seconds}
+
     # -- internals -------------------------------------------------------------
     def _idempotent(self, scope: str, key: str | None, action) -> dict:
         record_key = None if key is None else f'{scope}:{key}'
@@ -146,7 +188,13 @@ class PlatformService:
                 stored['idempotent'] = True
                 return stored
         try:
-            response = action()
+            # The action and its idempotency marker commit as one unit: a crash
+            # between them must not leave an applied action looking unrecorded.
+            with self.repository.transaction():
+                response = action()
+                if record_key is not None:
+                    self.repository.put(IDEMPOTENCY_NAMESPACE, record_key,
+                                        {'response': response, 'recorded_at': self.clock()})
         except VersionConflict as exc:
             raise ServiceError('revision_conflict',
                                f'expected revision {exc.expected}, found {exc.actual}', 409) from None
@@ -156,7 +204,4 @@ class PlatformService:
             raise ServiceError('mission_error', str(exc), 422) from None
         except MapFormatError as exc:
             raise ServiceError('map_format_error', str(exc), 422) from None
-        if record_key is not None:
-            self.repository.put(IDEMPOTENCY_NAMESPACE, record_key,
-                                {'response': response, 'recorded_at': self.clock()})
         return response

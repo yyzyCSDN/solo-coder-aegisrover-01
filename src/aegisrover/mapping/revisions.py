@@ -100,15 +100,48 @@ class MapRepository:
                   'author': actor, 'note': note, 'cells': normalised,
                   'created_at': self._clock()}
         revision = MapRevision(**staged, digest=_digest(staged))
-        self._repo.put(NAMESPACE, f'{map_id}@{revision.revision:05d}', revision.to_dict())
-        self._audit.append(actor, 'map.save', map_id,
-                           {'revision': revision.revision, 'cells': len(normalised),
-                            'digest': revision.digest})
+        with self._repo.transaction():
+            self._repo.put(NAMESPACE, f'{map_id}@{revision.revision:05d}', revision.to_dict())
+            self._audit.append(actor, 'map.save', map_id,
+                               {'revision': revision.revision, 'cells': len(normalised),
+                                'digest': revision.digest})
         return revision
 
     def rollback(self, map_id: str, revision: int, *, actor: str = 'operator') -> MapRevision:
         target = self.get(map_id, revision)
         return self.save(map_id, target.cells, actor=actor, note=f'rollback to r{revision}')
+
+    # -- retention ---------------------------------------------------------------
+    def prune_revisions(self, map_id: str | None = None, *, keep_last: int = 10,
+                        actor: str = 'operator') -> dict[str, int]:
+        """Physically remove all but the newest ``keep_last`` revisions of each map.
+
+        Every revision is stored as its own record, so without pruning the map
+        namespace grows by one record per edit forever. The latest revision is
+        never removed. Returns how many revisions were pruned per map; maps that
+        fit within ``keep_last`` are omitted. The pruning itself is one atomic
+        unit and is recorded in the audit log.
+        """
+        if keep_last < 1:
+            raise ValueError('keep_last must be at least 1')
+        map_ids = [map_id] if map_id is not None else self._map_ids()
+        pruned: dict[str, int] = {}
+        with self._repo.transaction():
+            for mid in map_ids:
+                revisions = [item.revision for item in self.history(mid)]
+                drop = revisions[:-keep_last] if len(revisions) > keep_last else []
+                if not drop:
+                    continue
+                for rev in drop:
+                    self._repo.purge(NAMESPACE, f'{mid}@{rev:05d}')
+                pruned[mid] = len(drop)
+                self._audit.append(actor, 'map.prune', mid,
+                                   {'kept': keep_last, 'pruned': len(drop)})
+        return pruned
+
+    def _map_ids(self) -> list[str]:
+        ids = {record.key.rsplit('@', 1)[0] for record in self._repo.scan(NAMESPACE)}
+        return sorted(ids)
 
     # -- reads -----------------------------------------------------------------
     def latest(self, map_id: str) -> MapRevision | None:

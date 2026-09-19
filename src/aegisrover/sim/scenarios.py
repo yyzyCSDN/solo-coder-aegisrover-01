@@ -97,9 +97,10 @@ class ScenarioStore:
         staged = replace(spec, revision=revision, events=ordered)
         digest = compute_digest(staged.normalised())
         record = replace(staged, digest=digest)
-        self._repo.put(NAMESPACE, f'{spec.scenario_id}@{revision:04d}', record.to_dict())
-        self._audit.append(actor, 'scenario.save', spec.scenario_id,
-                           {'revision': revision, 'digest': digest, 'events': len(ordered)})
+        with self._repo.transaction():
+            self._repo.put(NAMESPACE, f'{spec.scenario_id}@{revision:04d}', record.to_dict())
+            self._audit.append(actor, 'scenario.save', spec.scenario_id,
+                               {'revision': revision, 'digest': digest, 'events': len(ordered)})
         return record
 
     # -- reads -----------------------------------------------------------------

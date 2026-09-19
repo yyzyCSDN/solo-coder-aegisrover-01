@@ -146,10 +146,11 @@ class SessionRegistry:
             capabilities=frozenset(capabilities),
             audit_trail=({'at': now, 'event': 'open', 'actor': operator},),
         )
-        self._repo.put(SESSION_NAMESPACE, session.session_id, session.to_dict())
-        self._audit.append(operator, 'session.open', session.session_id,
-                           {'robot': robot, 'lease_seconds': lease_seconds,
-                            'cpu_limit': cpu_limit, 'wall_limit': wall_limit})
+        with self._repo.transaction():
+            self._repo.put(SESSION_NAMESPACE, session.session_id, session.to_dict())
+            self._audit.append(operator, 'session.open', session.session_id,
+                               {'robot': robot, 'lease_seconds': lease_seconds,
+                                'cpu_limit': cpu_limit, 'wall_limit': wall_limit})
         return session
 
     def heartbeat(self, session_id: str, *, lease_seconds: float | None = None,
@@ -225,7 +226,9 @@ class SessionRegistry:
         updated = replace(session, state=state, audit_trail=trail, revision=session.revision + 1,
                           heartbeat_at=now)
         record = self._repo.get(SESSION_NAMESPACE, session.session_id)
-        self._repo.put(SESSION_NAMESPACE, session.session_id, updated.to_dict(), expected=record.version)
-        self._audit.append(actor, f'session.{state}', session.session_id,
-                           {'robot': session.robot, 'reason': reason})
+        with self._repo.transaction():
+            self._repo.put(SESSION_NAMESPACE, session.session_id, updated.to_dict(),
+                           expected=record.version)
+            self._audit.append(actor, f'session.{state}', session.session_id,
+                               {'robot': session.robot, 'reason': reason})
         return updated

@@ -202,6 +202,37 @@ def test_map_revisions_history_and_rollback(repo):
         maps.save('yard', {(9, 9): 1}, expected_revision=1)
 
 
+def test_map_prune_revisions_converges_storage(repo):
+    audit = AuditLog(repo, Clock())
+    maps = MapRepository(repo, audit=audit, clock=Clock())
+    for i in range(5):
+        maps.save('yard', {f'{i},0': i}, note=f'rev {i}')
+    maps.save('depot', {'0,0': 1})
+    pruned = maps.prune_revisions('yard', keep_last=2)
+    assert pruned == {'yard': 3}
+    assert [m.revision for m in maps.history('yard')] == [4, 5]
+    assert maps.latest('yard').cells == {'4,0': 4}
+    with pytest.raises(KeyError):
+        maps.get('yard', 1)
+    # other maps are untouched, and the pruning itself is audited
+    assert maps.latest('depot').revision == 1
+    assert 'map.prune' in {e.action for e in audit.entries()}
+    assert audit.verify() == ()
+
+
+def test_map_prune_revisions_across_all_maps(repo):
+    maps = MapRepository(repo, audit=AuditLog(repo, Clock()), clock=Clock())
+    for i in range(4):
+        maps.save('yard', {f'{i},0': i})
+        maps.save('depot', {f'{i},1': i})
+    assert maps.prune_revisions(keep_last=3) == {'depot': 1, 'yard': 1}
+    assert [m.revision for m in maps.history('yard')] == [2, 3, 4]
+    # a second run with nothing to prune is a no-op
+    assert maps.prune_revisions(keep_last=3) == {}
+    with pytest.raises(ValueError):
+        maps.prune_revisions(keep_last=0)
+
+
 def test_three_way_merge_combines_disjoint_edits(repo):
     maps = MapRepository(repo, audit=AuditLog(repo, Clock()), clock=Clock())
     base = maps.save('yard', {'0,0': 1, '1,1': 1}, actor='planner')
