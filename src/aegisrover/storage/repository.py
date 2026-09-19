@@ -5,6 +5,13 @@ revisions, session state and operational settings. Every write bumps a per-recor
 version and records an immutable history row, so a caller that read version *n* can
 detect that somebody else already wrote version *n + 1* instead of silently
 overwriting it.
+
+Multi-record changes run inside :meth:`Repository.transaction` (or the convenience
+wrapper :meth:`Repository.batch_mutate`): every write in the block shares one SQLite
+transaction, so an error halfway through a batch rolls *all* of it back instead of
+leaving half-applied interrelated records. History itself is reclaimed with
+:meth:`Repository.prune_history` under an explicit retention policy; hash-chained and
+append-only namespaces (audit trail, event log) are protected by the policy defaults.
 """
 from __future__ import annotations
 
@@ -12,10 +19,16 @@ import hashlib
 import json
 import sqlite3
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterable, Iterator, Sequence
 
-__all__ = ('Record', 'Page', 'VersionConflict', 'NotFound', 'Repository', 'canonical_json')
+__all__ = ('Record', 'Page', 'PutOp', 'DeleteOp', 'RetentionPolicy', 'PruneReport',
+           'VersionConflict', 'NotFound', 'Repository', 'PROTECTED_NAMESPACES',
+           'DEFAULT_RETENTION', 'canonical_json')
+
+#: Append-only / hash-chained namespaces whose rows must never be pruned silently.
+PROTECTED_NAMESPACES: tuple[str, ...] = ('audit', 'events')
 
 
 def canonical_json(value: Any) -> str:
@@ -80,6 +93,59 @@ class Page:
         return {'items': [i.to_dict() for i in self.items], 'cursor': self.cursor, 'has_more': self.has_more}
 
 
+@dataclass(frozen=True)
+class PutOp:
+    """One upsert inside a batch."""
+    ns: str
+    key: str
+    payload: Any
+    expected: int | None = None
+
+
+@dataclass(frozen=True)
+class DeleteOp:
+    """One tombstone inside a batch."""
+    ns: str
+    key: str
+    expected: int | None = None
+
+
+@dataclass(frozen=True)
+class RetentionPolicy:
+    """Convergence rule for ``record_history`` rows.
+
+    A history version survives when it is the record's current/live version
+    (``keep_live``), or one of the most recent ``keep_last`` versions, or newer than
+    ``max_age_seconds``. Everything else is pruned. Namespaces in
+    :data:`PROTECTED_NAMESPACES` are skipped unless explicitly listed in
+    ``include_namespaces``; pruning is restricted to ``namespaces`` when it is set.
+    """
+    keep_last: int = 50
+    max_age_seconds: float | None = None
+    keep_live: bool = True
+    namespaces: tuple[str, ...] | None = None
+    include_namespaces: tuple[str, ...] = ()
+
+    def applies_to(self, ns: str) -> bool:
+        if self.namespaces is not None:
+            return ns in self.namespaces
+        if ns in PROTECTED_NAMESPACES:
+            return ns in self.include_namespaces
+        return True
+
+
+@dataclass(frozen=True)
+class PruneReport:
+    deleted_history_rows: int = 0
+    affected_records: int = 0
+
+    def __bool__(self) -> bool:
+        return self.deleted_history_rows > 0
+
+
+DEFAULT_RETENTION = RetentionPolicy(keep_last=50)
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS records (
     ns TEXT NOT NULL,
@@ -125,6 +191,58 @@ class Repository:
         self._conn.execute('PRAGMA journal_mode=WAL')
         self._conn.execute('PRAGMA foreign_keys=ON')
         self._conn.executescript(SCHEMA)
+        self._savepoint_depth = 0
+
+    # -- transactions ----------------------------------------------------------
+    @contextmanager
+    def transaction(self):
+        """One atomic block for several interrelated writes.
+
+        The outermost block opens ``BEGIN IMMEDIATE``; nested blocks become
+        SAVEPOINTs. Raising any exception rolls back exactly that block (and every
+        write done through this repository inside it, including audit entries);
+        completing normally commits everything together.
+        """
+        if self._savepoint_depth == 0:
+            self._conn.execute('BEGIN IMMEDIATE')
+            self._savepoint_depth = 1
+            try:
+                yield self
+            except Exception:
+                self._conn.execute('ROLLBACK')
+                self._savepoint_depth = 0
+                raise
+            else:
+                self._conn.execute('COMMIT')
+                self._savepoint_depth = 0
+        else:
+            name = f'sp_{self._savepoint_depth}'
+            self._conn.execute(f'SAVEPOINT {name}')
+            self._savepoint_depth += 1
+            depth = self._savepoint_depth
+            try:
+                yield self
+            except Exception:
+                self._conn.execute(f'ROLLBACK TO SAVEPOINT {name}')
+                self._conn.execute(f'RELEASE SAVEPOINT {name}')
+                self._savepoint_depth = depth - 1
+                raise
+            else:
+                self._conn.execute(f'RELEASE SAVEPOINT {name}')
+                self._savepoint_depth = depth - 1
+
+    def batch_mutate(self, ops: Sequence[PutOp | DeleteOp]) -> tuple[Record, ...]:
+        """Apply many upserts/tombstones atomically; all succeed or none do."""
+        with self.transaction():
+            return tuple(self.apply(op) for op in ops)
+
+    def apply(self, op: PutOp | DeleteOp) -> Record:
+        """Apply a single :class:`PutOp` / :class:`DeleteOp` inside open txn."""
+        if isinstance(op, PutOp):
+            return self.put(op.ns, op.key, op.payload, expected=op.expected)
+        if isinstance(op, DeleteOp):
+            return self.delete(op.ns, op.key, expected=op.expected)
+        raise TypeError(f'unsupported batch op: {op!r}')
 
     # -- reads -----------------------------------------------------------------
     def get(self, ns: str, key: str, *, include_deleted: bool = False) -> Record:
@@ -154,6 +272,13 @@ class Repository:
         rows = self._conn.execute('SELECT DISTINCT ns FROM records ORDER BY ns').fetchall()
         return tuple(r['ns'] for r in rows)
 
+    def keys_with_prefix(self, ns: str, prefix: str) -> tuple[str, ...]:
+        """Distinct stored keys in ``ns`` starting with ``prefix`` (any table)."""
+        rows = self._conn.execute(
+            'SELECT DISTINCT key FROM record_history WHERE ns=? AND key LIKE ?',
+            (ns, f'{prefix}%')).fetchall()
+        return tuple(r['key'] for r in rows)
+
     # -- writes ----------------------------------------------------------------
     def put(self, ns: str, key: str, payload: Any, *, expected: int | None = None) -> Record:
         """Insert or update ``payload``.
@@ -161,8 +286,7 @@ class Repository:
         ``expected=None`` means "create or overwrite unconditionally"; pass the
         version you read to get optimistic concurrency instead.
         """
-        self._conn.execute('BEGIN IMMEDIATE')
-        try:
+        with self.transaction():
             row = self._conn.execute(
                 'SELECT version, deleted FROM records WHERE ns=? AND key=?', (ns, key)
             ).fetchone()
@@ -186,16 +310,11 @@ class Repository:
                 ' VALUES (?,?,?,?,?,?,0,?)',
                 (ns, key, version, body, etag, updated_at, self._clock()),
             )
-            self._conn.execute('COMMIT')
-        except Exception:
-            self._conn.execute('ROLLBACK')
-            raise
         return Record(ns, key, version, payload, etag, updated_at)
 
     def delete(self, ns: str, key: str, *, expected: int | None = None) -> Record:
-        """Tombstone a record. History is preserved."""
-        self._conn.execute('BEGIN IMMEDIATE')
-        try:
+        """Tombstone a record. History is preserved (subject to retention pruning)."""
+        with self.transaction():
             row = self._conn.execute(
                 'SELECT version, payload FROM records WHERE ns=? AND key=? AND deleted=0', (ns, key)
             ).fetchone()
@@ -216,11 +335,73 @@ class Repository:
                 ' VALUES (?,?,?,?,?,?,1,?)',
                 (ns, key, version, row['payload'], etag, updated_at, self._clock()),
             )
-            self._conn.execute('COMMIT')
-        except Exception:
-            self._conn.execute('ROLLBACK')
-            raise
         return Record(ns, key, version, None, etag, updated_at, deleted=True)
+
+    # -- retention / convergence -----------------------------------------------
+    def prune_history(self, policy: RetentionPolicy | None = None) -> PruneReport:
+        """Delete ``record_history`` rows that fall outside ``policy``.
+
+        Always preserves the live row (current version) and the tombstone row per
+        record unless ``keep_live`` is disabled, so optimistic concurrency and
+        rollback-to-last stay intact. Protected namespaces (audit hash chain,
+        ordered event log) are skipped unless the policy opts in explicitly.
+        """
+        policy = policy or DEFAULT_RETENTION
+        # Parameters must be appended in the same order the placeholders appear.
+        conditions: list[str] = []
+        params: list[Any] = []
+        if policy.keep_live:
+            conditions.append(
+                'h.version < COALESCE((SELECT r.version FROM records r'
+                ' WHERE r.ns = h.ns AND r.key = h.key), 0)')
+        if policy.keep_last > 0:
+            conditions.append(
+                'h.version <= (SELECT MAX(version) - ? FROM record_history'
+                ' WHERE ns = h.ns AND key = h.key)')
+            params.append(policy.keep_last)
+        if policy.max_age_seconds is not None:
+            cutoff = float(self._clock()) - float(policy.max_age_seconds)
+            conditions.append('h.updated_at < ?')
+            params.append(cutoff)
+        where = ' AND '.join(conditions)
+        applicable = [ns for (ns,) in self._conn.execute(
+            'SELECT DISTINCT ns FROM record_history').fetchall() if policy.applies_to(ns)]
+        if not applicable:
+            return PruneReport()
+        ns_placeholders = ','.join('?' for _ in applicable)
+        candidate_sql = (
+            f'SELECT h.ns, h.key, h.version FROM record_history h'
+            f' WHERE h.ns IN ({ns_placeholders}) AND ({where})')
+        with self.transaction():
+            candidates = self._conn.execute(
+                candidate_sql, applicable + params).fetchall()
+            removed = len(candidates)
+            affected = len({(r['ns'], r['key']) for r in candidates})
+            self._conn.execute(
+                f'DELETE FROM record_history WHERE rowid IN'
+                f' (SELECT h.rowid FROM record_history h'
+                f'  WHERE h.ns IN ({ns_placeholders}) AND ({where}))',
+                applicable + params)
+        return PruneReport(deleted_history_rows=removed, affected_records=affected)
+
+    def purge_keys(self, ns: str, keys: Iterable[str]) -> int:
+        """Hard-delete records *and* their history (used by retention on map logs).
+
+        Unlike :meth:`delete` this leaves no tombstone; callers are expected to run
+        it only under an explicit retention policy. Returns the number of records
+        removed.
+        """
+        keys = tuple(keys)
+        if not keys:
+            return 0
+        placeholders = ','.join('?' for _ in keys)
+        with self.transaction():
+            cur = self._conn.execute(
+                f'DELETE FROM records WHERE ns=? AND key IN ({placeholders})', (ns, *keys))
+            removed = cur.rowcount
+            self._conn.execute(
+                f'DELETE FROM record_history WHERE ns=? AND key IN ({placeholders})', (ns, *keys))
+        return removed
 
     # -- paging ----------------------------------------------------------------
     def page(self, ns: str, *, limit: int = 50, cursor: str | None = None, prefix: str = '') -> Page:

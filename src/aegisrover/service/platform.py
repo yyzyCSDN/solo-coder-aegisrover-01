@@ -19,7 +19,13 @@ from aegisrover.mapping.revisions import MapFormatError, MapRepository, MapRevis
 from aegisrover.runtime.session import SessionError, SessionRegistry
 from aegisrover.storage.audit import AuditLog
 from aegisrover.storage.event_store import EventStore
-from aegisrover.storage.repository import NotFound, Repository, VersionConflict, canonical_json
+from aegisrover.storage.repository import (
+    NotFound,
+    Repository,
+    RetentionPolicy,
+    VersionConflict,
+    canonical_json,
+)
 
 __all__ = ('ServiceError', 'PlatformService')
 
@@ -90,6 +96,45 @@ class PlatformService:
             raise ServiceError('revision_conflict',
                                f'expected revision {exc.expected}, found {exc.actual}', 409) from None
         return {'revision': revision.revision, 'etag': revision.digest, 'cells': len(revision.cells)}
+
+    def save_maps(self, changes: list, *, actor: str = 'operator', note: str = '') -> dict:
+        """Atomically save a group of interrelated map edits.
+
+        ``changes`` is a list of ``(map_id, cells)`` or ``(map_id, cells,
+        if_match)``. Either every revision (and its audit entry) commits, or the
+        whole group is rejected — nothing partial is ever visible.
+        """
+        try:
+            revisions = self.maps.save_many(changes, actor=actor, note=note)
+        except VersionConflict as exc:
+            raise ServiceError('revision_conflict',
+                               f'{exc.ns}/{exc.key}: expected revision {exc.expected},'
+                               f' found {exc.actual}', 409) from None
+        return {'saved': [{'map_id': r.map_id, 'revision': r.revision,
+                           'etag': r.digest, 'cells': len(r.cells)} for r in revisions]}
+
+    def prune_history(self, *, keep_last: int = 50, max_age_seconds: float | None = None,
+                      namespaces: tuple[str, ...] | None = None,
+                      include_protected: tuple[str, ...] = ()) -> dict:
+        """Converge version history under a retention policy.
+
+        Applies to ordinary record history by default; the audit hash chain and
+        ordered event log are never touched unless explicitly named.
+        """
+        policy = RetentionPolicy(
+            keep_last=keep_last, max_age_seconds=max_age_seconds,
+            namespaces=namespaces, include_namespaces=include_protected)
+        report = self.repository.prune_history(policy)
+        return {'deleted_history_rows': report.deleted_history_rows,
+                'affected_records': report.affected_records}
+
+    def prune_maps(self, *, keep_last: int = 50, max_age_seconds: float | None = None,
+                   actor: str = 'retention') -> dict:
+        """Delete map revisions older than the retention window."""
+        report = self.maps.prune_revisions(keep_last=keep_last,
+                                           max_age_seconds=max_age_seconds, actor=actor)
+        return {'removed_revisions': report.removed_revisions,
+                'affected_maps': list(report.affected_maps)}
 
     def get_map(self, map_id: str, revision: int | None = None) -> dict:
         try:

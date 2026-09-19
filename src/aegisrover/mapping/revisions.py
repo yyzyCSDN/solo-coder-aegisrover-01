@@ -17,7 +17,8 @@ from typing import Iterable
 from aegisrover.storage.audit import AuditLog
 from aegisrover.storage.repository import Repository, canonical_json
 
-__all__ = ('MapRevision', 'MergeResult', 'MapRepository', 'MapFormatError')
+__all__ = ('MapRevision', 'MergeResult', 'MapRepository', 'MapFormatError',
+           'MapPruneReport')
 
 NAMESPACE = 'maps'
 FORMAT_VERSION = 2
@@ -25,6 +26,12 @@ FORMAT_VERSION = 2
 
 class MapFormatError(ValueError):
     pass
+
+
+@dataclass(frozen=True)
+class MapPruneReport:
+    removed_revisions: int = 0
+    affected_maps: tuple[str, ...] = ()
 
 
 def _digest(payload: dict) -> str:
@@ -88,23 +95,99 @@ class MapRepository:
     # -- writes ----------------------------------------------------------------
     def save(self, map_id: str, cells: dict, *, expected_revision: int | None = None,
              actor: str = 'operator', note: str = '') -> MapRevision:
+        with self._repo.transaction():
+            return self._save_locked(map_id, cells, expected_revision, actor, note)
+
+    def save_many(self, changes: Iterable[tuple], *, actor: str = 'operator',
+                  note: str = '') -> tuple[MapRevision, ...]:
+        """Apply many (possibly interrelated) map changes atomically.
+
+        Each change is ``(map_id, cells)`` or ``(map_id, cells,
+        expected_revision)``. All revisions and their audit entries commit together;
+        a stale revision, bad payload or any other failure rolls the whole group
+        back so a caller never sees half a batch.
+        """
+        normalised = []
+        for change in changes:
+            if len(change) == 2:
+                map_id, cells = change
+                expected = None
+            elif len(change) == 3:
+                map_id, cells, expected = change
+            else:
+                raise MapFormatError('change must be (map_id, cells) or'
+                                     ' (map_id, cells, expected_revision)')
+            normalised.append((map_id, cells, expected))
+        with self._repo.transaction():
+            saved = tuple(self._save_locked(map_id, cells, expected, actor,
+                                            note or 'batch save')
+                          for map_id, cells, expected in normalised)
+            self._audit.append(actor, 'map.save_many',
+                               ','.join(m.map_id for m in saved),
+                               {'revisions': [m.revision for m in saved],
+                                'maps': len(saved)})
+        return saved
+
+    def _save_locked(self, map_id: str, cells: dict,
+                     expected_revision: int | None, actor: str, note: str) -> MapRevision:
+        """Build and persist one revision; caller owns the transaction."""
         latest = self.latest(map_id)
         current = 0 if latest is None else latest.revision
         if expected_revision is not None and expected_revision != current:
             from aegisrover.storage.repository import VersionConflict
 
             raise VersionConflict(NAMESPACE, map_id, expected_revision, current)
-        normalised = _normalise_cells(cells)
+        normalised_cells = _normalise_cells(cells)
         staged = {'map_id': map_id, 'revision': current + 1,
                   'parent': None if latest is None else latest.revision,
-                  'author': actor, 'note': note, 'cells': normalised,
+                  'author': actor, 'note': note, 'cells': normalised_cells,
                   'created_at': self._clock()}
         revision = MapRevision(**staged, digest=_digest(staged))
         self._repo.put(NAMESPACE, f'{map_id}@{revision.revision:05d}', revision.to_dict())
         self._audit.append(actor, 'map.save', map_id,
-                           {'revision': revision.revision, 'cells': len(normalised),
+                           {'revision': revision.revision, 'cells': len(normalised_cells),
                             'digest': revision.digest})
         return revision
+
+    def prune_revisions(self, *, keep_last: int = 50,
+                        max_age_seconds: float | None = None,
+                        actor: str = 'retention') -> MapPruneReport:
+        """Converge stored map revisions under a retention policy.
+
+        Every map keeps its latest revision plus the ``keep_last`` newest ones (and
+        anything younger than ``max_age_seconds``). Older revision *records* (not
+        just history rows) are hard-deleted, so the maps namespace stops growing
+        without bound. Returns which revisions and maps were affected.
+        """
+        cutoff = None if max_age_seconds is None else self._clock() - float(max_age_seconds)
+        removed = 0
+        affected: list[str] = []
+        with self._repo.transaction():
+            all_keys = self._repo.keys_with_prefix(NAMESPACE, '')
+            map_ids = sorted({key.rsplit('@', 1)[0] for key in all_keys
+                              if '@' in key})
+            for map_id in map_ids:
+                revisions = self.history(map_id)
+                latest_rev = revisions[-1].revision
+                keep_floor = {m.revision for m in revisions[-keep_last:]} if keep_last > 0 else set()
+                stale = []
+                for revision in revisions:
+                    # The live head and the newest ``keep_last`` are never pruned;
+                    # everything older than the age window (or everything, when no
+                    # window is configured) is eligible.
+                    if revision.revision == latest_rev or revision.revision in keep_floor:
+                        continue
+                    if cutoff is not None and revision.created_at >= cutoff:
+                        continue
+                    stale.append(f'{map_id}@{revision.revision:05d}')
+                if stale:
+                    removed += self._repo.purge_keys(NAMESPACE, stale)
+                    affected.append(map_id)
+            if removed:
+                self._audit.append(actor, 'map.prune', NAMESPACE,
+                                   {'removed_revisions': removed,
+                                    'maps': affected, 'keep_last': keep_last})
+        return MapPruneReport(removed, tuple(affected))
 
     def rollback(self, map_id: str, revision: int, *, actor: str = 'operator') -> MapRevision:
         target = self.get(map_id, revision)

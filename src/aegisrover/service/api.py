@@ -36,6 +36,24 @@ class MapRequest(BaseModel):
     cells: dict[str, int]
     if_match: int | None = None
 
+
+class MapChange(BaseModel):
+    map_id: str
+    cells: dict[str, int]
+    if_match: int | None = None
+
+
+class MapBatchRequest(BaseModel):
+    changes: list[MapChange]
+    note: str = ''
+
+
+class RetentionRequest(BaseModel):
+    keep_last: int = 50
+    max_age_seconds: float | None = None
+    namespaces: list[str] | None = None
+    include_protected: list[str] = Field(default_factory=list)
+
 @app.get('/live')
 def live():
     return {'status': 'live'}
@@ -115,6 +133,27 @@ def open_session(req: SessionRequest):
 @app.post('/v1/maps/{map_id}')
 def save_map(map_id: str, req: MapRequest):
     return _guard(lambda: service.save_map(map_id, req.cells, if_match=req.if_match))
+
+
+@app.post('/v1/maps:batch')
+def save_maps_batch(req: MapBatchRequest):
+    changes = [(c.map_id, c.cells) if c.if_match is None
+               else (c.map_id, c.cells, c.if_match) for c in req.changes]
+    return _guard(lambda: service.save_maps(changes, note=req.note))
+
+
+@app.post('/v1/retention/prune')
+def prune_records(req: RetentionRequest):
+    return _guard(lambda: service.prune_history(
+        keep_last=req.keep_last, max_age_seconds=req.max_age_seconds,
+        namespaces=None if req.namespaces is None else tuple(req.namespaces),
+        include_protected=tuple(req.include_protected)))
+
+
+@app.post('/v1/map-revisions/prune')
+def prune_maps(req: RetentionRequest):
+    return _guard(lambda: service.prune_maps(
+        keep_last=req.keep_last, max_age_seconds=req.max_age_seconds))
 
 
 @app.get('/v1/maps/{map_id}')
